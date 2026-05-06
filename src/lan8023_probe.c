@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
+ * Copyright 2026 Free Mobile — Vincent Jardin
+ *
  * lan8023_probe.c — LAN8023 / LAN80XX SPI presence + identity probe.
  *
  * Check a LAN80XX-family PHY (LAN8023, LAN8044, etc.) over a Linux

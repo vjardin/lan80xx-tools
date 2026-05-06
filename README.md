@@ -36,4 +36,4 @@ phases (needed at high SCLK; 0 is fine at < 1 MHz).
 
 ## License
 
-BSD-3-Clause.
+BSD-3-Clause. Copyright 2026 Free Mobile — Vincent Jardin.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright 2026 Free Mobile — Vincent Jardin
+
 project('lan80xx-tools', 'c',
   version: '0.1.0',
   license: 'BSD-3-Clause',
