@@ -1,0 +1,2 @@
+option('static', type: 'boolean', value: false,
+  description: 'Link the binary statically (-static, pulls in libc.a). Useful for dropping a single self-contained probe binary onto a bring-up board.')
