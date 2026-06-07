@@ -28,3 +28,9 @@ executable('lan8023_probe',
   link_args: link_args,
   install: true,
 )
+
+executable('lan80xx_bringup',
+  'src/lan80xx_bringup.c',
+  link_args: link_args,
+  install: true,
+)

@@ -203,6 +203,9 @@ static int proxy_open(struct spi_ctx *s, const char *path)
 		close(s->fd);
 		return -1;
 	}
+	/* don't hang forever if the daemon wedges */
+	setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO,
+		   &(struct timeval){ .tv_sec = 2 }, sizeof(struct timeval));
 	s->proxy = true;
 	return 0;
 }
@@ -280,15 +283,28 @@ static int spi_reg_read(struct spi_ctx *s, unsigned int mmd,
 {
 	uint8_t tx[3 + MAX_PADDING + 4];
 	uint8_t rx[sizeof(tx)];
-	struct spi_ioc_transfer tr;
 	uint32_t a;
 	unsigned int d;
 
 	if (s->proxy)
 		return proxy_reg_read(s, mmd, addr, out);
 
+	/*
+	 * The chip pipelines reads: the response to request N is clocked
+	 * out during request N+1. One 2-transfer message (CS toggled
+	 * between frames) issues the request and then a dummy DEVICE_ID
+	 * request that collects the data — the same method the
+	 * lan80xx-spid daemon uses, making raw reads exact (the old
+	 * single-transfer read returned the PREVIOUS request's data).
+	 */
+	uint8_t tx2[sizeof(tx)];
+	uint8_t rx2[sizeof(tx)];
+	struct spi_ioc_transfer trs[2];
+
 	memset(tx, 0xff, sizeof(tx));
 	memset(rx, 0x00, sizeof(rx));
+	memset(tx2, 0xff, sizeof(tx2));
+	memset(rx2, 0x00, sizeof(rx2));
 
 	/* RW=0 (read) → top bit of byte 0 stays clear. */
 	a = ((s->channel & 0x3u)  << 21) |
@@ -298,23 +314,44 @@ static int spi_reg_read(struct spi_ctx *s, unsigned int mmd,
 	tx[1] = (uint8_t)(a >> 8);
 	tx[2] = (uint8_t)(a);
 
-	memset(&tr, 0, sizeof(tr));
-	tr.tx_buf = (unsigned long)tx;
-	tr.rx_buf = (unsigned long)rx;
-	tr.len = 3 + s->padding + 4;
-	tr.speed_hz = s->hz;
-	tr.bits_per_word = 8;
+	a = ((s->channel & 0x3u) << 21) |
+	    ((MMD_DEVICE_INFO & 0x1fu) << 16) |
+	     (REG_DEVICE_ID & 0xffffu);
+	tx2[0] = (uint8_t)(a >> 16);
+	tx2[1] = (uint8_t)(a >> 8);
+	tx2[2] = (uint8_t)(a);
 
-	if (ioctl(s->fd, SPI_IOC_MESSAGE(1), &tr) < 1) {
+	memset(trs, 0, sizeof(trs));
+	trs[0].tx_buf = (unsigned long)tx;
+	trs[0].rx_buf = (unsigned long)rx;
+	trs[0].len = 3 + s->padding + 4;
+	trs[0].speed_hz = s->hz;
+	trs[0].bits_per_word = 8;
+	trs[0].cs_change = 1;
+	/* thd;ssn (DS00006161 Table 4-23) = SCK period + 12 ns: the CS
+	 * high time between the frames scales with the clock period, or
+	 * the chip misses the boundary and streams (data slides 2 bytes
+	 * early -- bench-proven at 1 MHz). >= 2 SCK periods of delay. */
+	trs[0].delay_usecs = (uint16_t)(2000000 / s->hz + 1);
+	trs[1].tx_buf = (unsigned long)tx2;
+	trs[1].rx_buf = (unsigned long)rx2;
+	trs[1].len = 3 + s->padding + 4;
+	trs[1].speed_hz = s->hz;
+	trs[1].bits_per_word = 8;
+
+	if (ioctl(s->fd, SPI_IOC_MESSAGE(2), trs) < 1) {
 		warn("SPI_IOC_MESSAGE");
 		return -1;
 	}
 
-	d = 3 + s->padding;
-	*out = ((uint32_t)rx[d]     << 24) |
-	       ((uint32_t)rx[d + 1] << 16) |
-	       ((uint32_t)rx[d + 2] <<  8) |
-	       ((uint32_t)rx[d + 3]);
+	/* In the pipelined scheme the response follows the 3 address
+	 * bytes immediately; -p padding only extends the clocked window
+	 * (matches sw-mepa spi.c and the lan80xx-spid daemon). */
+	d = 3;
+	*out = ((uint32_t)rx2[d]     << 24) |
+	       ((uint32_t)rx2[d + 1] << 16) |
+	       ((uint32_t)rx2[d + 2] <<  8) |
+	       ((uint32_t)rx2[d + 3]);
 	return 0;
 }
 
