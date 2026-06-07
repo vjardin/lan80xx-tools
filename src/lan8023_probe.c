@@ -9,7 +9,16 @@
  * strap, MCU boot, and POST1 BIST registers ; it works without dependencies with
  * MEPA, MESA, or the kernel PHY framework. Useful as a first sanity
  * check when bringing up a board.
+ *
+ * The device argument is either a spidev node (exclusive raw access,
+ * as before) or a lan80xx-spid proxy unix socket (shared access,
+ * auto-detected via stat(); -s/-p then belong to the daemon). Going
+ * through the proxy also makes reads exact: the daemon handles the
+ * chip's pipelined-read protocol, whereas the raw single-transfer path
+ * below can return the previous request's data on some setups.
  */
+
+#define _DEFAULT_SOURCE		/* S_ISSOCK with -std=c17 */
 
 #include <err.h>
 #include <fcntl.h>
@@ -21,6 +30,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <linux/spi/spidev.h>
 
 #define MMD_DEVICE_INFO			0x1Eu	/* MMD_ID_MCU_IO_MNGT_MISC */
@@ -144,13 +156,108 @@ struct spi_ctx {
 	uint32_t	hz;
 	unsigned int	padding;
 	unsigned int	channel;
+	bool		proxy;		/* true: fd is a lan80xx-spid socket */
+	uint32_t	seq;
 };
+
+/*
+ * lan80xx-spid proxy wire protocol, L1 READ subset. Canonical
+ * definition: sw-mepa mepa_demo/spi_proxy/spiproxy.h (version 1);
+ * duplicated here so this file keeps its no-dependency property.
+ */
+#define PROXY_VER	1
+#define PROXY_READ	1
+#define PROXY_RESP	0x80
+#define PROXY_ST_OK	0
+
+struct proxy_hdr {
+	uint8_t		ver;
+	uint8_t		type;
+	uint16_t	flags;
+	uint32_t	seq;
+	uint32_t	len;
+};
+
+struct proxy_op {
+	uint8_t		slice;
+	uint8_t		write;
+	uint8_t		mmd;
+	uint8_t		rsvd;
+	uint16_t	reg;
+	uint16_t	rsvd2;
+	uint32_t	val;
+};
+
+static int proxy_open(struct spi_ctx *s, const char *path)
+{
+	struct sockaddr_un sa = { .sun_family = AF_UNIX };
+
+	s->fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+	if (s->fd < 0) {
+		warn("socket");
+		return -1;
+	}
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+	if (connect(s->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		warn("connect %s", path);
+		close(s->fd);
+		return -1;
+	}
+	s->proxy = true;
+	return 0;
+}
+
+static int proxy_reg_read(struct spi_ctx *s, unsigned int mmd,
+			  uint16_t addr, uint32_t *out)
+{
+	struct {
+		struct proxy_hdr h;
+		struct proxy_op op;
+	} msg;
+	ssize_t n;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.h.ver = PROXY_VER;
+	msg.h.type = PROXY_READ;
+	msg.h.seq = ++s->seq;
+	msg.h.len = sizeof(msg.op);
+	msg.op.slice = (uint8_t)s->channel;
+	msg.op.mmd = (uint8_t)mmd;
+	msg.op.reg = addr;
+	if (send(s->fd, &msg, sizeof(msg), 0) < 0) {
+		warn("proxy send");
+		return -1;
+	}
+	n = recv(s->fd, &msg, sizeof(msg), 0);
+	if (n < (ssize_t)sizeof(msg.h)) {
+		warn("proxy recv");
+		return -1;
+	}
+	if (msg.h.seq != s->seq || msg.h.type != (PROXY_READ | PROXY_RESP) ||
+	    msg.h.flags != PROXY_ST_OK) {
+		warnx("proxy read failed (status %u)", msg.h.flags);
+		return -1;
+	}
+	*out = msg.op.val;
+	return 0;
+}
 
 static int spi_open(struct spi_ctx *s, const char *dev, uint32_t hz,
 		    unsigned int padding, unsigned int channel)
 {
 	uint8_t mode = SPI_MODE_0;
 	uint8_t bits = 8;
+	struct stat st;
+
+	s->hz = hz;
+	s->padding = padding;
+	s->channel = channel;
+	s->proxy = false;
+	s->seq = 0;
+
+	/* A unix socket selects the lan80xx-spid proxy transport. */
+	if (stat(dev, &st) == 0 && S_ISSOCK(st.st_mode))
+		return proxy_open(s, dev);
 
 	s->fd = open(dev, O_RDWR);
 	if (s->fd < 0) {
@@ -165,13 +272,10 @@ static int spi_open(struct spi_ctx *s, const char *dev, uint32_t hz,
 		close(s->fd);
 		return -1;
 	}
-	s->hz = hz;
-	s->padding = padding;
-	s->channel = channel;
 	return 0;
 }
 
-static int spi_reg_read(const struct spi_ctx *s, unsigned int mmd,
+static int spi_reg_read(struct spi_ctx *s, unsigned int mmd,
 			uint16_t addr, uint32_t *out)
 {
 	uint8_t tx[3 + MAX_PADDING + 4];
@@ -179,6 +283,9 @@ static int spi_reg_read(const struct spi_ctx *s, unsigned int mmd,
 	struct spi_ioc_transfer tr;
 	uint32_t a;
 	unsigned int d;
+
+	if (s->proxy)
+		return proxy_reg_read(s, mmd, addr, out);
 
 	memset(tx, 0xff, sizeof(tx));
 	memset(rx, 0x00, sizeof(rx));
@@ -342,8 +449,10 @@ static void decode_post1_status(uint32_t raw, const struct chip_info *chip)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"Usage: %s <spidev> [-c channel] [-s speed_hz] [-p padding]\n"
-		"  spidev    e.g. /dev/spidev0.0\n"
+		"Usage: %s <spidev|proxy-socket> [-c channel] [-s speed_hz] [-p padding]\n"
+		"  spidev    e.g. /dev/spidev0.0 (exclusive raw access), or a\n"
+		"            lan80xx-spid unix socket (shared access, auto-detected;\n"
+		"            -s/-p are then owned by the daemon and ignored)\n"
 		"  -c 0..3   channel within the chip (default 0)\n"
 		"  -s hz     SPI clock in Hz (default 1000000)\n"
 		"  -p 0..%d   dummy bytes between addr and data (default 0)\n",
@@ -398,8 +507,12 @@ int main(int argc, char **argv)
 	if (spi_open(&s, dev, hz, padding, channel) < 0)
 		return EXIT_FAILURE;
 
-	printf("Probing %s  ch=%u  @ %u Hz  padding=%u\n\n",
-	       dev, channel, hz, padding);
+	if (s.proxy)
+		printf("Probing %s (lan80xx-spid proxy)  ch=%u\n\n",
+		       dev, channel);
+	else
+		printf("Probing %s  ch=%u  @ %u Hz  padding=%u\n\n",
+		       dev, channel, hz, padding);
 
 	/* DEVICE_ID first — if the bus is dead we bail before reading more. */
 	printf("DEVICE_ID:\n");
