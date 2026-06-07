@@ -28,6 +28,8 @@ meson compile -C build-static
 ```sh
 lan8023_probe /dev/spidev0.0
 lan8023_probe /dev/spidev0.0 -c 1 -s 1000000 -p 2
+lan8023_probe /var/run/spid.sock        # shared access via lan80xx-spid proxy
+
 ```
 
 `-c` selects the channel (0..3), `-s` the SCLK frequency in Hz,
