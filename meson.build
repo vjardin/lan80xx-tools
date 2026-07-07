@@ -2,7 +2,7 @@
 # Copyright 2026 Free Mobile — Vincent Jardin
 
 project('lan80xx-tools', 'c',
-  version: '0.1.0',
+  version: '1.1.0',
   license: 'BSD-3-Clause',
   meson_version: '>= 1.1.0',
   default_options: [
